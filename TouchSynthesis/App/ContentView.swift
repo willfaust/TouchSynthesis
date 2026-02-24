@@ -563,6 +563,10 @@ struct ContentView: View {
     // MARK: - Touch
 
     private func directTap(at point: CGPoint) async {
+        for i in stride(from: 3, through: 1, by: -1) {
+            logger.log("Tap in \(i)...", phase: "TOUCH", level: .info)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
         logger.log("Tap at (\(Int(point.x)), \(Int(point.y)))...", phase: "TOUCH", level: .info)
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             TouchSynthesizer.tap(at: point) { error in
@@ -588,6 +592,10 @@ struct ContentView: View {
     }
 
     private func directSwipe(from: CGPoint, to: CGPoint, duration: TimeInterval) async {
+        for i in stride(from: 3, through: 1, by: -1) {
+            logger.log("Swipe in \(i)...", phase: "TOUCH", level: .info)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
         logger.log("Swipe (\(Int(from.x)),\(Int(from.y))) → (\(Int(to.x)),\(Int(to.y)))...", phase: "TOUCH", level: .info)
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             TouchSynthesizer.swipe(from: from, to: to, duration: duration) { error in

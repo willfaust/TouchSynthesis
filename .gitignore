@@ -12,3 +12,4 @@ DerivedData/
 TouchSynthesis/idevice/idevice.h
 vendor/idevice/target/
 reference/
+build/

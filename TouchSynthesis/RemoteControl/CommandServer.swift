@@ -304,66 +304,111 @@ class CommandServer: ObservableObject {
     // MARK: - Streaming
 
     private func startStreaming(client: ClientConnection, quality: Double) {
-        guard let tunnel = tunnel else { return }
         logger.log("Starting stream (quality=\(quality))", phase: "REMOTE", level: .info)
-
         client.streaming = true
         let jpegQuality = CGFloat(max(0.1, min(1.0, quality)))
+
+        // Try XCTest daemon proxy screenshots first (much faster, no CDTunnel per frame)
+        if TouchSynthesizer.isLoaded {
+            startXCTestStream(client: client, quality: jpegQuality)
+        } else if let tunnel = tunnel {
+            startCDTunnelStream(client: client, tunnel: tunnel, quality: jpegQuality)
+        }
+    }
+
+    /// Stream screenshots via XCTest daemon proxy (reuses existing XPC connection).
+    private func startXCTestStream(client: ClientConnection, quality: CGFloat) {
+        logger.log("Using XCTest screenshot path", phase: "REMOTE", level: .info)
 
         screenshotQueue.async { [weak self, weak client] in
             var frameCount = 0
             var fpsTimer = CACurrentMediaTime()
             var sendInFlight = false
+            var consecutiveErrors = 0
 
             while let client, client.streaming {
                 guard self != nil else { break }
 
+                // Backpressure: wait if previous send hasn't completed
+                if sendInFlight {
+                    Thread.sleep(forTimeInterval: 0.01)
+                    continue
+                }
+
                 let captureStart = CACurrentMediaTime()
 
-                // Capture screenshot
-                var outError: NSString?
-                guard let pngData = tunnel.takeScreenshotAndReturnError(&outError) as Data? else {
+                // Synchronous wait for async XCTest screenshot
+                let semaphore = DispatchSemaphore(value: 0)
+                var resultData: Data?
+                var resultError: String?
+
+                TouchSynthesizer.takeScreenshot(withQuality: quality) { data, error in
+                    resultData = data as Data?
+                    resultError = error
+                    semaphore.signal()
+                }
+
+                let timeout = semaphore.wait(timeout: .now() + 5.0)
+                if timeout == .timedOut {
+                    consecutiveErrors += 1
+                    if consecutiveErrors >= 3 {
+                        DispatchQueue.main.async {
+                            self?.logger.log("XCTest screenshot timed out 3x, falling back to CDTunnel", phase: "REMOTE", level: .warning)
+                        }
+                        // Fall back to CDTunnel
+                        if let tunnel = self?.tunnel {
+                            self?.startCDTunnelStream(client: client, tunnel: tunnel, quality: quality)
+                        }
+                        return
+                    }
                     Thread.sleep(forTimeInterval: 0.05)
                     continue
                 }
 
-                let captureTime = CACurrentMediaTime() - captureStart
-                let convertStart = CACurrentMediaTime()
-
-                // Convert PNG → JPEG (much smaller, reduces HOL blocking for touch cmds)
-                guard let uiImage = UIImage(data: pngData),
-                      let jpegData = uiImage.jpegData(compressionQuality: jpegQuality) else {
+                guard let jpegData = resultData else {
+                    consecutiveErrors += 1
+                    if consecutiveErrors >= 5 {
+                        DispatchQueue.main.async {
+                            self?.logger.log("XCTest screenshot failed 5x (\(resultError ?? "unknown")), falling back to CDTunnel", phase: "REMOTE", level: .warning)
+                        }
+                        if let tunnel = self?.tunnel {
+                            self?.startCDTunnelStream(client: client, tunnel: tunnel, quality: quality)
+                        }
+                        return
+                    }
+                    Thread.sleep(forTimeInterval: 0.05)
                     continue
                 }
+                consecutiveErrors = 0
 
-                let convertTime = CACurrentMediaTime() - convertStart
+                let captureTime = CACurrentMediaTime() - captureStart
 
-                // Backpressure: skip frame if previous send hasn't completed
-                if sendInFlight {
-                    continue
+                // If we got PNG (from simple path), convert to JPEG
+                var finalData = jpegData
+                if jpegData.count > 8, jpegData[0] == 0x89, jpegData[1] == 0x50 { // PNG magic
+                    if let uiImage = UIImage(data: jpegData),
+                       let converted = uiImage.jpegData(compressionQuality: quality) {
+                        finalData = converted
+                    }
                 }
 
                 // Send binary frame
-                let frame = FrameCodec.encodeBinary(jpegData)
+                let frame = FrameCodec.encodeBinary(finalData)
                 sendInFlight = true
                 client.nwConn.send(content: frame, completion: .contentProcessed { _ in
                     sendInFlight = false
                 })
-
-                // Yield to prevent starving heartbeat and other threads
-                Thread.sleep(forTimeInterval: 0.01)
 
                 // FPS logging every 3 seconds
                 frameCount += 1
                 let now = CACurrentMediaTime()
                 if now - fpsTimer >= 3.0 {
                     let fps = Double(frameCount) / (now - fpsTimer)
-                    let pngKB = pngData.count / 1024
-                    let jpegKB = jpegData.count / 1024
+                    let kb = finalData.count / 1024
                     DispatchQueue.main.async { [weak self] in
                         self?.logger.log(
-                            String(format: "Stream: %.1f FPS, capture=%.0fms, convert=%.0fms, png=%dKB, jpg=%dKB",
-                                   fps, captureTime * 1000, convertTime * 1000, pngKB, jpegKB),
+                            String(format: "XCTest Stream: %.1f FPS, capture=%.0fms, %dKB/frame",
+                                   fps, captureTime * 1000, kb),
                             phase: "REMOTE", level: .debug
                         )
                     }
@@ -373,7 +418,71 @@ class CommandServer: ObservableObject {
             }
 
             DispatchQueue.main.async {
-                self?.logger.log("Stream stopped", phase: "REMOTE", level: .info)
+                self?.logger.log("XCTest stream stopped", phase: "REMOTE", level: .info)
+            }
+        }
+    }
+
+    /// Stream screenshots via CDTunnel (fallback — creates a new tunnel per frame).
+    private func startCDTunnelStream(client: ClientConnection, tunnel: IdeviceTunnel, quality: CGFloat) {
+        logger.log("Using CDTunnel screenshot path (fallback)", phase: "REMOTE", level: .info)
+
+        screenshotQueue.async { [weak self, weak client] in
+            var frameCount = 0
+            var fpsTimer = CACurrentMediaTime()
+            var sendInFlight = false
+
+            while let client, client.streaming {
+                guard self != nil else { break }
+
+                // Backpressure: wait instead of capturing screenshots to discard
+                if sendInFlight {
+                    Thread.sleep(forTimeInterval: 0.02)
+                    continue
+                }
+
+                let captureStart = CACurrentMediaTime()
+
+                var outError: NSString?
+                guard let pngData = tunnel.takeScreenshotAndReturnError(&outError) as Data? else {
+                    Thread.sleep(forTimeInterval: 0.05)
+                    continue
+                }
+
+                guard let uiImage = UIImage(data: pngData),
+                      let jpegData = uiImage.jpegData(compressionQuality: quality) else {
+                    continue
+                }
+
+                let captureTime = CACurrentMediaTime() - captureStart
+
+                let frame = FrameCodec.encodeBinary(jpegData)
+                sendInFlight = true
+                client.nwConn.send(content: frame, completion: .contentProcessed { _ in
+                    sendInFlight = false
+                })
+
+                Thread.sleep(forTimeInterval: 0.01)
+
+                frameCount += 1
+                let now = CACurrentMediaTime()
+                if now - fpsTimer >= 3.0 {
+                    let fps = Double(frameCount) / (now - fpsTimer)
+                    let jpegKB = jpegData.count / 1024
+                    DispatchQueue.main.async { [weak self] in
+                        self?.logger.log(
+                            String(format: "CDTunnel Stream: %.1f FPS, capture=%.0fms, %dKB/frame",
+                                   fps, captureTime * 1000, jpegKB),
+                            phase: "REMOTE", level: .debug
+                        )
+                    }
+                    frameCount = 0
+                    fpsTimer = now
+                }
+            }
+
+            DispatchQueue.main.async {
+                self?.logger.log("CDTunnel stream stopped", phase: "REMOTE", level: .info)
             }
         }
     }

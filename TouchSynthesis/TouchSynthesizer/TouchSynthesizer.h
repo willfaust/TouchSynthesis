@@ -108,6 +108,15 @@ NS_ASSUME_NONNULL_BEGIN
                                    liftOffset:(NSTimeInterval)liftOffset
                                    completion:(void (^)(NSString *_Nullable error))completion;
 
+// MARK: - Screenshot via XCTest Daemon Proxy
+
+/// Take a screenshot via testmanagerd XPC (reuses existing daemon session).
+/// Much faster than CDTunnel — no tunnel creation per frame.
+/// Returns JPEG data at the specified quality, or nil on error.
+/// Completion called on the calling thread/queue.
++ (void)takeScreenshotWithQuality:(CGFloat)quality
+                       completion:(void (^)(NSData *_Nullable jpegData, NSString *_Nullable error))completion;
+
 // MARK: - IOKit HID Fallback
 
 /// Returns a diagnostic string describing IOKit HID state (client, system, symbols loaded).

@@ -1105,6 +1105,141 @@ static void _installGlobalExceptionHandler(void) {
     });
 }
 
+// MARK: - Screenshot via XCTest Daemon Proxy
+//
+// Takes screenshots through the already-connected testmanagerd XPC session.
+// Avoids creating a new CDTunnel per frame. Can request JPEG directly.
+
++ (void)takeScreenshotWithQuality:(CGFloat)quality
+                       completion:(void (^)(NSData *_Nullable, NSString *_Nullable))completion {
+    if (!sFrameworkLoaded || !cls_XCTRunnerDaemonSession) {
+        completion(nil, @"Framework or session not loaded");
+        return;
+    }
+
+    _installNonFatalAssertionHandler();
+
+    @try {
+        id session = [cls_XCTRunnerDaemonSession performSelector:@selector(sharedSession)];
+        if (!session) { completion(nil, @"No shared session"); return; }
+
+        id proxy = nil;
+        if ([session respondsToSelector:@selector(daemonProxy)]) {
+            proxy = [session performSelector:@selector(daemonProxy)];
+        }
+        if (!proxy) { completion(nil, @"No daemon proxy"); return; }
+
+        // Try the parameterized path first: _XCT_requestScreenshot:withReply:
+        // This lets us specify JPEG encoding directly.
+        SEL requestSel = @selector(_XCT_requestScreenshot:withReply:);
+        if ([proxy respondsToSelector:requestSel]) {
+            // Build XCTScreenshotRequest with JPEG encoding
+            Class cls_Request = NSClassFromString(@"XCTScreenshotRequest");
+            Class cls_Encoding = NSClassFromString(@"XCTImageEncoding");
+
+            if (cls_Request && cls_Encoding) {
+                // Create encoding: JPEG at specified quality
+                id encoding = nil;
+                SEL encInitSel = @selector(initWithUniformTypeIdentifier:compressionQuality:);
+                if ([cls_Encoding instancesRespondToSelector:encInitSel]) {
+                    encoding = [cls_Encoding alloc];
+                    typedef id (*MsgSend_id_id_CGFloat)(id, SEL, id, CGFloat);
+                    encoding = ((MsgSend_id_id_CGFloat)objc_msgSend)(
+                        encoding, encInitSel, @"public.jpeg", quality);
+                }
+
+                if (encoding) {
+                    // Create request: screen 1 (main), full rect, JPEG encoding
+                    id request = nil;
+                    // Try initWithScreenID:rect:encoding:
+                    SEL reqInitSel = @selector(initWithScreenID:rect:encoding:);
+                    if ([cls_Request instancesRespondToSelector:reqInitSel]) {
+                        request = [cls_Request alloc];
+                        typedef id (*MsgSend_id_long_CGRect_id)(id, SEL, long, CGRect, id);
+                        request = ((MsgSend_id_long_CGRect_id)objc_msgSend)(
+                            request, reqInitSel, 1, CGRectNull, encoding);
+                    }
+                    // Fallback: try initWithEncoding:
+                    if (!request) {
+                        SEL reqInit2 = @selector(initWithEncoding:);
+                        if ([cls_Request instancesRespondToSelector:reqInit2]) {
+                            request = [cls_Request alloc];
+                            request = ((MsgSend_id_id)objc_msgSend)(request, reqInit2, encoding);
+                        }
+                    }
+
+                    if (request) {
+                        // Call _XCT_requestScreenshot:withReply:
+                        typedef void (*MsgSend_void_id_block)(id, SEL, id, void(^)(id, NSError *));
+                        ((MsgSend_void_id_block)objc_msgSend)(
+                            proxy, requestSel, request,
+                            ^(id image, NSError *error) {
+                                if (error || !image) {
+                                    completion(nil, error ? error.localizedDescription : @"No image returned");
+                                    return;
+                                }
+                                // Extract data from XCTImage
+                                NSData *data = nil;
+                                if ([image respondsToSelector:@selector(data)]) {
+                                    data = [image performSelector:@selector(data)];
+                                } else if ([image isKindOfClass:[NSData class]]) {
+                                    data = (NSData *)image;
+                                }
+                                if (data) {
+                                    completion(data, nil);
+                                } else {
+                                    completion(nil, @"Could not extract image data");
+                                }
+                            }
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Fallback: simple _XCT_requestScreenshotWithReply: (no encoding params)
+        SEL simpleSel = @selector(_XCT_requestScreenshotWithReply:);
+        if ([proxy respondsToSelector:simpleSel]) {
+            typedef void (*MsgSend_void_block)(id, SEL, void(^)(id, NSError *));
+            ((MsgSend_void_block)objc_msgSend)(
+                proxy, simpleSel,
+                ^(id image, NSError *error) {
+                    if (error || !image) {
+                        completion(nil, error ? error.localizedDescription : @"No image (simple path)");
+                        return;
+                    }
+                    NSData *data = nil;
+                    if ([image respondsToSelector:@selector(data)]) {
+                        data = [image performSelector:@selector(data)];
+                    } else if ([image respondsToSelector:@selector(pngRepresentation)]) {
+                        data = [image performSelector:@selector(pngRepresentation)];
+                    } else if ([image isKindOfClass:[NSData class]]) {
+                        data = (NSData *)image;
+                    }
+                    if (data) {
+                        completion(data, nil);
+                    } else {
+                        // Log what we got back for debugging
+                        NSLog(@"[TouchSynthesizer] Screenshot reply class: %@, responds data=%d pngRep=%d",
+                              NSStringFromClass([image class]),
+                              [image respondsToSelector:@selector(data)],
+                              [image respondsToSelector:@selector(pngRepresentation)]);
+                        completion(nil, [NSString stringWithFormat:@"Unknown image type: %@",
+                                        NSStringFromClass([image class])]);
+                    }
+                }
+            );
+            return;
+        }
+
+        completion(nil, @"No screenshot method available on daemon proxy");
+
+    } @catch (NSException *e) {
+        completion(nil, [NSString stringWithFormat:@"Screenshot exception: %@", e.reason]);
+    }
+}
+
 // MARK: - IOKit HID Bundle ID Spoofing
 
 static BOOL sBundleIDSwizzled = NO;

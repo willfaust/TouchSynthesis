@@ -1,4 +1,5 @@
 #import "TouchSynthesizer.h"
+#import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -90,6 +91,12 @@ typedef void (*MsgSend_void_id)(id, SEL, id);
 typedef void (*MsgSend_void_id_id)(id, SEL, id, id);
 typedef id (*MsgSend_id_id)(id, SEL, id);
 typedef id (*MsgSend_id_id_long)(id, SEL, id, long);
+
+// New gesture support
+typedef id (*MsgSend_id_void)(id, SEL);
+typedef void (*MsgSend_void_id_double_long_BOOL)(id, SEL, id, double, long, BOOL);
+typedef void (*MsgSend_void_id_NSUInteger_double)(id, SEL, id, NSUInteger, double);
+typedef void (*MsgSend_void_NSUInteger)(id, SEL, NSUInteger);
 
 // MARK: - Non-Fatal Assertion Handler
 //
@@ -460,6 +467,135 @@ static void _installGlobalExceptionHandler(void) {
     return record;
 }
 
++ (nullable id)_buildPinchEventAtCenter:(CGPoint)center
+                                 radius:(CGFloat)radius
+                                  scale:(CGFloat)scale
+                               duration:(NSTimeInterval)duration
+                                  error:(NSString **)outError {
+    id record = [self _createEventRecordWithName:@"pinch"];
+    if (!record) { if (outError) *outError = @"Failed to create event record"; return nil; }
+
+    CGFloat endRadius = radius * scale;
+    CGPoint f1Start = CGPointMake(center.x, center.y - radius);
+    CGPoint f1End   = CGPointMake(center.x, center.y - endRadius);
+    CGPoint f2Start = CGPointMake(center.x, center.y + radius);
+    CGPoint f2End   = CGPointMake(center.x, center.y + endRadius);
+
+    // Finger 1
+    id path1 = [cls_XCPointerEventPath alloc];
+    path1 = ((MsgSend_id_CGPoint_double)objc_msgSend)(path1, @selector(initForTouchAtPoint:offset:), f1Start, 0.0);
+    if (!path1) { if (outError) *outError = @"Failed to create path1"; return nil; }
+
+    int steps = 10;
+    for (int i = 1; i <= steps; i++) {
+        double t = (double)i / (double)steps;
+        CGPoint p = CGPointMake(f1Start.x + (f1End.x - f1Start.x) * t,
+                                f1Start.y + (f1End.y - f1Start.y) * t);
+        ((MsgSend_void_CGPoint_double)objc_msgSend)(path1, @selector(moveToPoint:atOffset:), p, duration * t);
+    }
+    ((MsgSend_void_double)objc_msgSend)(path1, @selector(liftUpAtOffset:), duration + 0.05);
+
+    // Finger 2
+    id path2 = [cls_XCPointerEventPath alloc];
+    path2 = ((MsgSend_id_CGPoint_double)objc_msgSend)(path2, @selector(initForTouchAtPoint:offset:), f2Start, 0.0);
+    if (!path2) { if (outError) *outError = @"Failed to create path2"; return nil; }
+
+    for (int i = 1; i <= steps; i++) {
+        double t = (double)i / (double)steps;
+        CGPoint p = CGPointMake(f2Start.x + (f2End.x - f2Start.x) * t,
+                                f2Start.y + (f2End.y - f2Start.y) * t);
+        ((MsgSend_void_CGPoint_double)objc_msgSend)(path2, @selector(moveToPoint:atOffset:), p, duration * t);
+    }
+    ((MsgSend_void_double)objc_msgSend)(path2, @selector(liftUpAtOffset:), duration + 0.05);
+
+    ((MsgSend_void_id)objc_msgSend)(record, @selector(addPointerEventPath:), path1);
+    ((MsgSend_void_id)objc_msgSend)(record, @selector(addPointerEventPath:), path2);
+    return record;
+}
+
++ (nullable id)_buildMultiFingerTapEventAtPoints:(NSArray<NSValue *> *)points
+                                           error:(NSString **)outError {
+    id record = [self _createEventRecordWithName:@"multi-finger tap"];
+    if (!record) { if (outError) *outError = @"Failed to create event record"; return nil; }
+
+    for (NSValue *val in points) {
+        CGPoint point = [val CGPointValue];
+        id path = [cls_XCPointerEventPath alloc];
+        path = ((MsgSend_id_CGPoint_double)objc_msgSend)(path, @selector(initForTouchAtPoint:offset:), point, 0.0);
+        if (!path) { if (outError) *outError = @"Failed to create event path"; return nil; }
+        ((MsgSend_void_double)objc_msgSend)(path, @selector(liftUpAtOffset:), 0.125);
+        ((MsgSend_void_id)objc_msgSend)(record, @selector(addPointerEventPath:), path);
+    }
+    return record;
+}
+
++ (nullable id)_buildBezierSwipeEventFrom:(CGPoint)start
+                            controlPoint1:(CGPoint)cp1
+                            controlPoint2:(CGPoint)cp2
+                                       to:(CGPoint)end
+                                 duration:(NSTimeInterval)duration
+                                    error:(NSString **)outError {
+    id record = [self _createEventRecordWithName:@"bezier swipe"];
+    if (!record) { if (outError) *outError = @"Failed to create event record"; return nil; }
+
+    id path = [cls_XCPointerEventPath alloc];
+    path = ((MsgSend_id_CGPoint_double)objc_msgSend)(path, @selector(initForTouchAtPoint:offset:), start, 0.0);
+    if (!path) { if (outError) *outError = @"Failed to create event path"; return nil; }
+
+    int steps = 20;
+    for (int i = 1; i <= steps; i++) {
+        double t = (double)i / (double)steps;
+        double u = 1.0 - t;
+        double uu = u * u;
+        double uuu = uu * u;
+        double tt = t * t;
+        double ttt = tt * t;
+        CGPoint p = CGPointMake(
+            uuu * start.x + 3.0 * uu * t * cp1.x + 3.0 * u * tt * cp2.x + ttt * end.x,
+            uuu * start.y + 3.0 * uu * t * cp1.y + 3.0 * u * tt * cp2.y + ttt * end.y);
+        ((MsgSend_void_CGPoint_double)objc_msgSend)(path, @selector(moveToPoint:atOffset:), p, duration * t);
+    }
+    ((MsgSend_void_double)objc_msgSend)(path, @selector(liftUpAtOffset:), duration + 0.05);
+    ((MsgSend_void_id)objc_msgSend)(record, @selector(addPointerEventPath:), path);
+    return record;
+}
+
++ (nullable id)_buildTypeTextEvent:(NSString *)text
+                       typingSpeed:(NSInteger)speed
+                             error:(NSString **)outError {
+    id record = [self _createEventRecordWithName:@"type text"];
+    if (!record) { if (outError) *outError = @"Failed to create event record"; return nil; }
+
+    id path = [cls_XCPointerEventPath alloc];
+    path = ((MsgSend_id_void)objc_msgSend)(path, @selector(initForTextInput));
+    if (!path) { if (outError) *outError = @"Failed to create text input path"; return nil; }
+
+    ((MsgSend_void_id_double_long_BOOL)objc_msgSend)(
+        path, @selector(typeText:atOffset:typingSpeed:shouldRedact:),
+        text, 0.0, (long)speed, NO);
+
+    ((MsgSend_void_id)objc_msgSend)(record, @selector(addPointerEventPath:), path);
+    return record;
+}
+
++ (nullable id)_buildTypeKeyEvent:(NSString *)key
+                        modifiers:(NSUInteger)modifiers
+                            error:(NSString **)outError {
+    id record = [self _createEventRecordWithName:@"key combo"];
+    if (!record) { if (outError) *outError = @"Failed to create event record"; return nil; }
+
+    id path = [cls_XCPointerEventPath alloc];
+    path = ((MsgSend_id_void)objc_msgSend)(path, @selector(initForTextInput));
+    if (!path) { if (outError) *outError = @"Failed to create text input path"; return nil; }
+
+    ((MsgSend_void_id_NSUInteger_double)objc_msgSend)(
+        path, @selector(typeKey:modifiers:atOffset:),
+        key, modifiers, 0.0);
+
+    ((MsgSend_void_id)objc_msgSend)(record, @selector(addPointerEventPath:), path);
+    return record;
+}
+
 // MARK: - Synthesis Chain (daemonProxy → session → eventSynthesizer)
 
 + (void)_synthesizeEvent:(id)record completion:(void (^)(NSString *_Nullable))completion {
@@ -564,6 +700,108 @@ static void _installGlobalExceptionHandler(void) {
         }
     }
     completion(@"No synthesis path available");
+}
+
+// MARK: - Pinch
+
++ (void)pinchAtCenter:(CGPoint)center
+               radius:(CGFloat)radius
+                scale:(CGFloat)scale
+             duration:(NSTimeInterval)duration
+           completion:(void (^)(NSString *_Nullable))completion {
+    NSLog(@"[TouchSynthesizer] pinch center=(%.0f,%.0f) radius=%.0f scale=%.2f", center.x, center.y, radius, scale);
+    if (!sFrameworkLoaded) { completion(@"Not loaded"); return; }
+
+    NSString *err = nil;
+    id record = [self _buildPinchEventAtCenter:center radius:radius scale:scale duration:duration error:&err];
+    if (!record) { completion(err); return; }
+    [self _synthesizeEvent:record completion:completion];
+}
+
+// MARK: - Multi-Finger Tap
+
++ (void)multiFingerTapAtPoints:(NSArray<NSValue *> *)points
+                    completion:(void (^)(NSString *_Nullable))completion {
+    NSLog(@"[TouchSynthesizer] multiFingerTap with %lu points", (unsigned long)points.count);
+    if (!sFrameworkLoaded) { completion(@"Not loaded"); return; }
+    if (points.count == 0) { completion(@"No points provided"); return; }
+
+    NSString *err = nil;
+    id record = [self _buildMultiFingerTapEventAtPoints:points error:&err];
+    if (!record) { completion(err); return; }
+    [self _synthesizeEvent:record completion:completion];
+}
+
+// MARK: - Bezier Curve Swipe
+
++ (void)bezierSwipeFrom:(CGPoint)start
+          controlPoint1:(CGPoint)cp1
+          controlPoint2:(CGPoint)cp2
+                     to:(CGPoint)end
+               duration:(NSTimeInterval)duration
+             completion:(void (^)(NSString *_Nullable))completion {
+    NSLog(@"[TouchSynthesizer] bezierSwipe (%.0f,%.0f)->(%.0f,%.0f)", start.x, start.y, end.x, end.y);
+    if (!sFrameworkLoaded) { completion(@"Not loaded"); return; }
+
+    NSString *err = nil;
+    id record = [self _buildBezierSwipeEventFrom:start controlPoint1:cp1 controlPoint2:cp2 to:end duration:duration error:&err];
+    if (!record) { completion(err); return; }
+    [self _synthesizeEvent:record completion:completion];
+}
+
+// MARK: - Keyboard Text Input
+
++ (void)typeText:(NSString *)text
+     typingSpeed:(NSInteger)speed
+      completion:(void (^)(NSString *_Nullable))completion {
+    NSLog(@"[TouchSynthesizer] typeText: '%@' speed=%ld", text, (long)speed);
+    if (!sFrameworkLoaded) { completion(@"Not loaded"); return; }
+
+    NSString *err = nil;
+    id record = [self _buildTypeTextEvent:text typingSpeed:speed error:&err];
+    if (!record) { completion(err); return; }
+    [self _synthesizeEvent:record completion:completion];
+}
+
+// MARK: - Key Combos
+
++ (void)typeKey:(NSString *)key
+      modifiers:(NSUInteger)modifiers
+     completion:(void (^)(NSString *_Nullable))completion {
+    NSLog(@"[TouchSynthesizer] typeKey: '%@' modifiers=%lu", key, (unsigned long)modifiers);
+    if (!sFrameworkLoaded) { completion(@"Not loaded"); return; }
+
+    NSString *err = nil;
+    id record = [self _buildTypeKeyEvent:key modifiers:modifiers error:&err];
+    if (!record) { completion(err); return; }
+    [self _synthesizeEvent:record completion:completion];
+}
+
+// MARK: - Hardware Buttons
+
++ (void)pressButton:(NSUInteger)button
+         completion:(void (^)(NSString *_Nullable))completion {
+    NSLog(@"[TouchSynthesizer] pressButton: %lu", (unsigned long)button);
+    if (!sFrameworkLoaded) { completion(@"Not loaded"); return; }
+    if (!cls_XCUIDevice) { completion(@"XCUIDevice not available"); return; }
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        _installNonFatalAssertionHandler();
+        @try {
+            id device = [cls_XCUIDevice performSelector:@selector(sharedDevice)];
+            if (!device) {
+                dispatch_async(dispatch_get_main_queue(), ^{ completion(@"XCUIDevice.sharedDevice returned nil"); });
+                return;
+            }
+            ((MsgSend_void_NSUInteger)objc_msgSend)(device, @selector(pressButton:), button);
+            sLastPathUsed = @"XCUIDevice.pressButton";
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+        } @catch (NSException *e) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion([NSString stringWithFormat:@"pressButton threw: %@", e.reason]);
+            });
+        }
+    });
 }
 
 // MARK: - IOKit HID Loading

@@ -55,6 +55,49 @@ NS_ASSUME_NONNULL_BEGIN
               duration:(NSTimeInterval)duration
             completion:(void (^)(NSString *_Nullable error))completion;
 
+// MARK: - Pinch (Zoom In/Out)
+
+/// Pinch gesture centered at a point. scale > 1.0 = zoom in, < 1.0 = zoom out.
++ (void)pinchAtCenter:(CGPoint)center
+               radius:(CGFloat)radius
+                scale:(CGFloat)scale
+             duration:(NSTimeInterval)duration
+           completion:(void (^)(NSString *_Nullable error))completion;
+
+// MARK: - Multi-Finger Tap
+
+/// Tap with multiple fingers simultaneously. Points are NSValue-wrapped CGPoints.
++ (void)multiFingerTapAtPoints:(NSArray<NSValue *> *)points
+                    completion:(void (^)(NSString *_Nullable error))completion;
+
+// MARK: - Bezier Curve Swipe
+
+/// Swipe along a cubic bezier curve.
++ (void)bezierSwipeFrom:(CGPoint)start
+          controlPoint1:(CGPoint)cp1
+          controlPoint2:(CGPoint)cp2
+                     to:(CGPoint)end
+               duration:(NSTimeInterval)duration
+             completion:(void (^)(NSString *_Nullable error))completion;
+
+// MARK: - Keyboard Text Input
+
+/// Type text. Requires a text field to be focused.
++ (void)typeText:(NSString *)text
+     typingSpeed:(NSInteger)speed
+      completion:(void (^)(NSString *_Nullable error))completion;
+
+/// Press a key combination (e.g. Cmd+A). Modifiers: Caps=1, Shift=2, Ctrl=4, Alt=8, Cmd=16.
++ (void)typeKey:(NSString *)key
+      modifiers:(NSUInteger)modifiers
+     completion:(void (^)(NSString *_Nullable error))completion;
+
+// MARK: - Hardware Buttons
+
+/// Press a hardware button. 1=Home, 2=VolumeUp, 3=VolumeDown.
++ (void)pressButton:(NSUInteger)button
+         completion:(void (^)(NSString *_Nullable error))completion;
+
 // MARK: - IOKit HID Fallback
 
 /// Inject a tap via IOKit HID (bypasses XCTest/testmanagerd).

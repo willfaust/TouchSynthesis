@@ -156,6 +156,32 @@ struct ContentView: View {
                     }
                 }
 
+                HStack(spacing: 8) {
+                    glassButton("Pinch In", icon: "arrow.up.left.and.arrow.down.right", alwaysEnabled: true) {
+                        Task { await directPinch(center: CGPoint(x: 195, y: 422), radius: 100, scale: 0.5) }
+                    }
+                    glassButton("Pinch Out", icon: "arrow.down.right.and.arrow.up.left", alwaysEnabled: true) {
+                        Task { await directPinch(center: CGPoint(x: 195, y: 422), radius: 50, scale: 2.0) }
+                    }
+                    glassButton("2-Tap", icon: "hand.tap", alwaysEnabled: true) {
+                        Task { await directMultiFingerTap(points: [CGPoint(x: 150, y: 422), CGPoint(x: 240, y: 422)]) }
+                    }
+                    glassButton("Type", icon: "keyboard", alwaysEnabled: true) {
+                        Task { await directTypeText("Hello") }
+                    }
+                }
+                HStack(spacing: 8) {
+                    glassButton("Home", icon: "house", alwaysEnabled: true) {
+                        Task { await directPressButton(1) }
+                    }
+                    glassButton("Vol+", icon: "speaker.plus", alwaysEnabled: true) {
+                        Task { await directPressButton(2) }
+                    }
+                    glassButton("Vol-", icon: "speaker.minus", alwaysEnabled: true) {
+                        Task { await directPressButton(3) }
+                    }
+                }
+
                 // Screenshot (small, left) + Touch canvas (right)
                 HStack(alignment: .top, spacing: 10) {
                     // Small screenshot thumbnail — tappable
@@ -619,6 +645,93 @@ struct ContentView: View {
         try? await Task.sleep(nanoseconds: 500_000_000)
         await takeDeviceScreenshot()
     }
+
+    // MARK: - Pinch
+
+    private func directPinch(center: CGPoint, radius: CGFloat, scale: CGFloat) async {
+        for i in stride(from: 3, through: 1, by: -1) {
+            logger.log("Pinch in \(i)...", phase: "TOUCH", level: .info)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        logger.log("Pinch at (\(Int(center.x)),\(Int(center.y))) scale=\(scale)...", phase: "TOUCH", level: .info)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            TouchSynthesizer.pinch(atCenter: center, radius: radius, scale: scale, duration: 0.5) { error in
+                if let error = error {
+                    self.logger.log("Pinch failed: \(error)", phase: "TOUCH", level: .error)
+                } else {
+                    self.logger.log("Pinch OK via \(TouchSynthesizer.lastPathUsed)", phase: "TOUCH", level: .success)
+                }
+                continuation.resume()
+            }
+        }
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        await takeDeviceScreenshot()
+    }
+
+    // MARK: - Multi-Finger Tap
+
+    private func directMultiFingerTap(points: [CGPoint]) async {
+        for i in stride(from: 3, through: 1, by: -1) {
+            logger.log("\(points.count)-finger tap in \(i)...", phase: "TOUCH", level: .info)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        let nsPoints = points.map { NSValue(cgPoint: $0) }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            TouchSynthesizer.multiFingerTap(atPoints: nsPoints) { error in
+                if let error = error {
+                    self.logger.log("Multi-finger tap failed: \(error)", phase: "TOUCH", level: .error)
+                } else {
+                    self.logger.log("Multi-finger tap OK via \(TouchSynthesizer.lastPathUsed)", phase: "TOUCH", level: .success)
+                }
+                continuation.resume()
+            }
+        }
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        await takeDeviceScreenshot()
+    }
+
+    // MARK: - Type Text
+
+    private func directTypeText(_ text: String) async {
+        for i in stride(from: 3, through: 1, by: -1) {
+            logger.log("Type in \(i)...", phase: "TOUCH", level: .info)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        logger.log("Typing '\(text)'...", phase: "TOUCH", level: .info)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            TouchSynthesizer.typeText(text, typingSpeed: 60) { error in
+                if let error = error {
+                    self.logger.log("Type text failed: \(error)", phase: "TOUCH", level: .error)
+                } else {
+                    self.logger.log("Type text OK via \(TouchSynthesizer.lastPathUsed)", phase: "TOUCH", level: .success)
+                }
+                continuation.resume()
+            }
+        }
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        await takeDeviceScreenshot()
+    }
+
+    // MARK: - Hardware Buttons
+
+    private func directPressButton(_ button: UInt) async {
+        let names: [UInt: String] = [1: "Home", 2: "Volume Up", 3: "Volume Down"]
+        let name = names[button] ?? "Button \(button)"
+        logger.log("Pressing \(name)...", phase: "TOUCH", level: .info)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            TouchSynthesizer.pressButton(button) { error in
+                if let error = error {
+                    self.logger.log("\(name) failed: \(error)", phase: "TOUCH", level: .error)
+                } else {
+                    self.logger.log("\(name) OK", phase: "TOUCH", level: .success)
+                }
+                continuation.resume()
+            }
+        }
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        await takeDeviceScreenshot()
+    }
+
 }
 
 // MARK: - Liquid Glass Modifier

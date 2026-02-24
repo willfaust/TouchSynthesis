@@ -1,0 +1,36 @@
+name: TouchSynthesis
+options:
+  bundleIdPrefix: com.touchsynthesis
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "16.0"
+  generateEmptyDirectories: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: "UT49TA9TA4"
+targets:
+  TouchSynthesis:
+    type: application
+    platform: iOS
+    sources:
+      - path: TouchSynthesis
+        excludes:
+          - "idevice/libidevice_ffi.a"
+          - "idevice/idevice.h"
+    settings:
+      base:
+        INFOPLIST_FILE: TouchSynthesis/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.touchsynthesis.app
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: "UT49TA9TA4"
+        SWIFT_OBJC_BRIDGING_HEADER: TouchSynthesis/TouchSynthesis-Bridging-Header.h
+        LIBRARY_SEARCH_PATHS:
+          - "$(PROJECT_DIR)/TouchSynthesis/idevice"
+        HEADER_SEARCH_PATHS:
+          - "$(PROJECT_DIR)/TouchSynthesis/idevice"
+        OTHER_LDFLAGS:
+          - "-lidevice_ffi"
+          - "-lSystem"
+          - "-framework Security"
+          - "-framework SystemConfiguration"

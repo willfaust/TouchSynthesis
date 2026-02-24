@@ -1,0 +1,91 @@
+diff --git a/ffi/src/lib.rs b/ffi/src/lib.rs
+index f93806a..a64b912 100644
+--- a/ffi/src/lib.rs
++++ b/ffi/src/lib.rs
+@@ -385,6 +385,86 @@ pub unsafe extern "C" fn idevice_free(idevice: *mut IdeviceHandle) {
+     }
+ }
+ 
++/// Sends data through a ReadWriteOpaque stream
++///
++/// # Safety
++/// `stream` must be a valid pointer to a ReadWriteOpaque allocated by this library
++/// `data` must be a valid pointer to at least `length` bytes
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn readwrite_send(
++    stream: *mut ReadWriteOpaque,
++    data: *const u8,
++    length: usize,
++) -> *mut IdeviceFfiError {
++    if stream.is_null() || data.is_null() {
++        return ffi_err!(IdeviceError::FfiInvalidArg);
++    }
++
++    let stream_ref = unsafe { &mut *stream };
++    let inner = match stream_ref.inner.as_mut() {
++        Some(i) => i,
++        None => return ffi_err!(IdeviceError::FfiInvalidArg),
++    };
++
++    let data_slice = unsafe { std::slice::from_raw_parts(data, length) };
++    let res = run_sync(async move {
++        use tokio::io::AsyncWriteExt;
++        inner.write_all(data_slice).await
++    });
++
++    match res {
++        Ok(_) => null_mut(),
++        Err(e) => ffi_err!(e),
++    }
++}
++
++/// Receives data from a ReadWriteOpaque stream
++///
++/// # Safety
++/// `stream` must be a valid pointer to a ReadWriteOpaque allocated by this library
++/// `data` must be a valid pointer to at least `max_length` bytes
++/// `length` must be a valid pointer to a usize
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn readwrite_recv(
++    stream: *mut ReadWriteOpaque,
++    data: *mut u8,
++    length: *mut usize,
++    max_length: usize,
++) -> *mut IdeviceFfiError {
++    if stream.is_null() || data.is_null() || length.is_null() {
++        return ffi_err!(IdeviceError::FfiInvalidArg);
++    }
++
++    let stream_ref = unsafe { &mut *stream };
++    let inner = match stream_ref.inner.as_mut() {
++        Some(i) => i,
++        None => return ffi_err!(IdeviceError::FfiInvalidArg),
++    };
++
++    let res = run_sync(async move {
++        use tokio::io::AsyncReadExt;
++        let mut buf = vec![0u8; max_length];
++        let n = inner.read(&mut buf).await?;
++        buf.truncate(n);
++        Ok::<Vec<u8>, std::io::Error>(buf)
++    });
++
++    match res {
++        Ok(received_data) => {
++            let received_len = received_data.len();
++            if received_len > max_length {
++                return ffi_err!(IdeviceError::FfiBufferTooSmall(received_len, max_length));
++            }
++            unsafe {
++                std::ptr::copy_nonoverlapping(received_data.as_ptr(), data, received_len);
++                *length = received_len;
++            }
++            null_mut()
++        }
++        Err(e) => ffi_err!(e),
++    }
++}
++
+ /// Frees a stream handle
+ ///
+ /// # Safety

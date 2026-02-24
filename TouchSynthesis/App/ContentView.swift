@@ -22,6 +22,10 @@ struct ContentView: View {
     @State private var automationReady = false
     @State private var status: String = ""
 
+    // Remote control
+    @State private var commandServer: CommandServer?
+    @State private var remoteEnabled = false
+
     // Display
     @State private var screenshotImage: UIImage?
     @State private var touchDots: [CGPoint] = []
@@ -32,6 +36,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     pairingBar
                     controlSection
+                    remoteControlSection
                     interactionSection
                     logSection
                 }
@@ -131,6 +136,47 @@ struct ContentView: View {
                 statusDot("Alive", on: lastPingOk)
                 statusDot("BG", on: keepAliveActive)
                 statusDot("Touch", on: automationReady)
+                statusDot("Remote", on: remoteEnabled)
+            }
+        }
+    }
+
+    // MARK: - Remote Control Section
+
+    private var remoteControlSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if automationReady {
+                HStack {
+                    glassButton(remoteEnabled ? "Stop Server" : "Start Server",
+                               icon: remoteEnabled ? "antenna.radiowaves.left.and.right.slash" : "antenna.radiowaves.left.and.right",
+                               alwaysEnabled: true) {
+                        if remoteEnabled {
+                            stopRemoteServer()
+                        } else {
+                            startRemoteServer()
+                        }
+                    }
+                    Spacer()
+                    if remoteEnabled {
+                        if let server = commandServer {
+                            HStack(spacing: 8) {
+                                if server.tcpRunning {
+                                    Text("TCP :8347")
+                                        .font(.caption2)
+                                        .foregroundStyle(.green)
+                                }
+                                if server.wifiAwareRunning {
+                                    Text("WiFi Aware")
+                                        .font(.caption2)
+                                        .foregroundStyle(.green)
+                                }
+                                Text("\(server.connectedClients) client\(server.connectedClients == 1 ? "" : "s")")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -501,6 +547,9 @@ struct ContentView: View {
         isStopping = true
         logger.log("Stopping UI automation...", phase: "STOP", level: .info)
 
+        // Stop remote server
+        stopRemoteServer()
+
         // Disconnect testmanagerd DTX sessions
         testManager?.disconnect()
         testManager = nil
@@ -532,6 +581,23 @@ struct ContentView: View {
         isStopping = false
         status = "Stopped. You may need to hold volume buttons to dismiss the overlay."
         logger.log("All connections torn down", phase: "STOP", level: .success)
+    }
+
+    // MARK: - Remote Server
+
+    private func startRemoteServer() {
+        let server = CommandServer(logger: logger)
+        server.tunnel = ideviceTunnel
+        server.start()
+        commandServer = server
+        remoteEnabled = true
+        logger.log("Remote server started", phase: "REMOTE", level: .success)
+    }
+
+    private func stopRemoteServer() {
+        commandServer?.stop()
+        commandServer = nil
+        remoteEnabled = false
     }
 
     // MARK: - Heartbeat

@@ -50,6 +50,21 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>WiFiAwareServices</key>
+	<array>
+		<dict>
+			<key>WAServiceType</key>
+			<string>_touchsynth._tcp</string>
+			<key>WAServiceName</key>
+			<string>TouchSynthesis Remote Control</string>
+		</dict>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Allows remote control clients to connect for touch synthesis.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_touchsynth._tcp</string>
+	</array>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>

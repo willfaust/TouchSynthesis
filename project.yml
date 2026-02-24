@@ -25,6 +25,7 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: "UT49TA9TA4"
         SWIFT_OBJC_BRIDGING_HEADER: TouchSynthesis/TouchSynthesis-Bridging-Header.h
+        CODE_SIGN_ENTITLEMENTS: TouchSynthesis/TouchSynthesis.entitlements
         LIBRARY_SEARCH_PATHS:
           - "$(PROJECT_DIR)/TouchSynthesis/idevice"
         HEADER_SEARCH_PATHS:
@@ -34,3 +35,4 @@ targets:
           - "-lSystem"
           - "-framework Security"
           - "-framework SystemConfiguration"
+          - "-framework Network"

@@ -10,15 +10,15 @@
 // Touch event synthesis via XCTest private API + IOKit HID.
 //
 // Synthesis chain (tried in order):
-//   1. daemonProxy._XCT_synthesizeEvent:completion:
-//      System-level synthesis via testmanagerd XPC proxy.
-//      Works across all apps. Preferred path.
+//   1. record.synthesizeWithError: — synchronous, in-process,
+//      bypasses testmanagerd entirely. No quiescence wait. FAST.
 //
-//   2. session.synthesizeEvent:completion:
-//      XCTRunnerDaemonSession wrapper. May silently drop events
-//      if automation mode isn't active.
+//   2. XCUIDevice.eventSynthesizer.synthesizeEvent:completion:
+//      WDA's synthesis path. Fallback if Path 1 fails.
 //
-//   3. XCUIDevice.eventSynthesizer (app-level, last resort)
+//   3. daemonProxy._XCT_synthesizeEvent:completion:
+//      Fire-and-forget via testmanagerd XPC. Has ~5s quiescence
+//      wait (unavoidable). Last resort for XCTest path.
 //
 //   4. IOKit HID direct injection (separate methods, bypasses XCTest)
 // ============================================================
@@ -248,7 +248,263 @@ static void _installGlobalExceptionHandler(void) {
     }
 
     sFrameworkLoaded = YES;
+
+    // Dump all available XCTest methods for diagnostics
+    [self _dumpXCTestDiagnostics];
+
+    // Disable quiescence waiting — prevents testmanagerd from polling our process
+    [self _disableQuiescenceWaiting];
+
     return nil;
+}
+
+// MARK: - Disable Quiescence Waiting
+//
+// Even though we use synthesizeWithError: (which bypasses the daemon),
+// testmanagerd may still poll our process for quiescence status via XPC.
+// These swizzles immediately respond "idle" to prevent CPU overhead.
+
++ (void)_disableQuiescenceWaiting {
+    NSLog(@"[TouchSynthesizer] Disabling quiescence waiting...");
+    int fixed = 0;
+
+    // 1. XCTRunnerAutomationSession — immediately report idle
+    Class runnerAutoSession = NSClassFromString(@"XCTRunnerAutomationSession");
+    if (runnerAutoSession) {
+        Method m;
+        m = class_getInstanceMethod(runnerAutoSession, @selector(notifyWhenMainRunLoopIsIdle:));
+        if (m) {
+            method_setImplementation(m, imp_implementationWithBlock(^(id self, id block) {
+                if (block) ((void(^)(void))block)();
+            }));
+            fixed++;
+        }
+        m = class_getInstanceMethod(runnerAutoSession, @selector(notifyWhenAnimationsAreIdle:));
+        if (m) {
+            method_setImplementation(m, imp_implementationWithBlock(^(id self, id block) {
+                if (block) ((void(^)(void))block)();
+            }));
+            fixed++;
+        }
+    }
+
+    // 2. XCTAutomationSession — XPC callback methods
+    Class autoSession = NSClassFromString(@"XCTAutomationSession");
+    if (autoSession) {
+        Method m;
+        m = class_getInstanceMethod(autoSession, @selector(_XCT_notifyWhenMainRunLoopIsIdle));
+        if (m) { method_setImplementation(m, imp_implementationWithBlock(^(id self) {})); fixed++; }
+        m = class_getInstanceMethod(autoSession, @selector(_XCT_notifyWhenAnimationsAreIdle));
+        if (m) { method_setImplementation(m, imp_implementationWithBlock(^(id self) {})); fixed++; }
+        m = class_getInstanceMethod(autoSession, @selector(notifyWhenMainRunLoopIsIdle:));
+        if (m) {
+            method_setImplementation(m, imp_implementationWithBlock(^(id self, id block) {
+                if (block) ((void(^)(void))block)();
+            }));
+            fixed++;
+        }
+        m = class_getInstanceMethod(autoSession, @selector(notifyWhenAnimationsAreIdle:));
+        if (m) {
+            method_setImplementation(m, imp_implementationWithBlock(^(id self, id block) {
+                if (block) ((void(^)(void))block)();
+            }));
+            fixed++;
+        }
+    }
+
+    // 3. XCAXClient_iOS — accessibility quiescence
+    Class axClient = NSClassFromString(@"XCAXClient_iOS");
+    if (axClient) {
+        Method m;
+        m = class_getInstanceMethod(axClient, @selector(waitForQuiescenceOnAllForegroundApplicationsAsPreEvent:));
+        if (m) { method_setImplementation(m, imp_implementationWithBlock(^(id self, BOOL pre) {})); fixed++; }
+        m = class_getInstanceMethod(axClient, @selector(notifyWhenEventLoopIsIdleForApplication:reply:));
+        if (m) {
+            method_setImplementation(m, imp_implementationWithBlock(^(id self, id app, id reply) {
+                if (reply) ((void(^)(void))reply)();
+            }));
+            fixed++;
+        }
+    }
+
+    // 4. XCUIApplicationProcess — skip quiescence checks
+    Class appProcess = NSClassFromString(@"XCUIApplicationProcess");
+    if (appProcess) {
+        IMP yesIMP = imp_implementationWithBlock(^BOOL(id self) { return YES; });
+        Method m;
+        m = class_getInstanceMethod(appProcess, @selector(shouldSkipPreEventQuiescence));
+        if (m) { method_setImplementation(m, yesIMP); fixed++; }
+        m = class_getInstanceMethod(appProcess, @selector(shouldSkipPostEventQuiescence));
+        if (m) { method_setImplementation(m, yesIMP); fixed++; }
+        m = class_getInstanceMethod(appProcess, @selector(isQuiescent));
+        if (m) { method_setImplementation(m, yesIMP); fixed++; }
+        m = class_getInstanceMethod(appProcess, @selector(eventLoopHasIdled));
+        if (m) { method_setImplementation(m, yesIMP); fixed++; }
+    }
+
+    // 5. Set implicitEventConfirmationInterval to 0
+    @try {
+        id session = [cls_XCTRunnerDaemonSession performSelector:@selector(sharedSession)];
+        if (session) {
+            SEL s1 = @selector(setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:);
+            if ([session respondsToSelector:s1]) {
+                ((void (*)(id, SEL, double))objc_msgSend)(session, s1, 0.0);
+                fixed++;
+            }
+            SEL s2 = @selector(setImplicitEventConfirmationIntervalForCurrentContext:);
+            if ([session respondsToSelector:s2]) {
+                ((void (*)(id, SEL, double))objc_msgSend)(session, s2, 0.0);
+                fixed++;
+            }
+        }
+    } @catch (NSException *e) {}
+
+    NSLog(@"[TouchSynthesizer] Quiescence disable: %d fixes applied", fixed);
+}
+
+// MARK: - XCTest Diagnostics
+
+/// Enumerate all methods on key XCTest objects to find quiescence/configuration options.
+/// Writes output to a file (os_log redacts dynamic strings as <private>).
++ (void)_dumpXCTestDiagnostics {
+    NSMutableString *out = [NSMutableString stringWithString:@"=== XCTest API Enumeration ===\n\n"];
+
+    // 1. Enumerate methods on the session class
+    [self _appendMethodsForClass:cls_XCTRunnerDaemonSession label:@"XCTRunnerDaemonSession" to:out];
+
+    // 2. Get the shared session instance and check its class hierarchy
+    @try {
+        id session = [cls_XCTRunnerDaemonSession performSelector:@selector(sharedSession)];
+        if (session) {
+            [out appendFormat:@"\nSession instance class: %@\n", NSStringFromClass([session class])];
+            [self _appendMethodsForClass:[session class] label:@"session_instance" to:out];
+
+            // 3. Get daemon proxy and enumerate its methods
+            if ([session respondsToSelector:@selector(daemonProxy)]) {
+                id proxy = [session performSelector:@selector(daemonProxy)];
+                if (proxy) {
+                    [out appendFormat:@"\nDaemonProxy class: %@\n", NSStringFromClass([proxy class])];
+                    [self _appendMethodsForClass:[proxy class] label:@"daemonProxy" to:out];
+
+                    if ([proxy isKindOfClass:[NSProxy class]]) {
+                        [out appendString:@"  (NSProxy — methods come from XPC protocol)\n"];
+                    }
+                } else {
+                    [out appendString:@"\nDaemonProxy is nil\n"];
+                }
+            }
+        } else {
+            [out appendString:@"\nSession is nil (not yet initialized)\n"];
+        }
+    } @catch (NSException *e) {
+        [out appendFormat:@"\nException getting session/proxy: %@\n", e.reason];
+    }
+
+    // 4. Enumerate other potentially useful classes
+    NSArray *classNames = @[
+        @"XCUIDevice", @"XCTRunnerAutomationSession",
+        @"XCSyntheticEventGenerator", @"XCEventGenerator",
+        @"XCUIApplicationProcess", @"XCUIApplication",
+        @"XCUIApplicationMonitor", @"XCUIApplicationStateMonitor",
+        @"XCTCapabilities", @"XCTCapabilitiesBuilder",
+        @"XCPointerEventPath", @"XCSynthesizedEventRecord",
+    ];
+    for (NSString *name in classNames) {
+        Class cls = NSClassFromString(name);
+        if (cls) {
+            [self _appendMethodsForClass:cls label:name to:out];
+        } else {
+            [out appendFormat:@"\nClass %@ NOT FOUND\n", name];
+        }
+    }
+
+    // 5. Search all loaded classes for quiescence/timeout methods
+    [out appendString:@"\n=== Searching all XC* classes for quiescence/timeout/idle methods ===\n"];
+    unsigned int classCount = 0;
+    Class *allClasses = objc_copyClassList(&classCount);
+    int found = 0;
+    for (unsigned int i = 0; i < classCount; i++) {
+        NSString *className = NSStringFromClass(allClasses[i]);
+        if (![className hasPrefix:@"XC"]) continue;
+
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(allClasses[i], &methodCount);
+        for (unsigned int j = 0; j < methodCount; j++) {
+            NSString *selName = NSStringFromSelector(method_getName(methods[j]));
+            NSString *lower = selName.lowercaseString;
+            if ([lower containsString:@"quiescen"] ||
+                [lower containsString:@"animationidle"] ||
+                [lower containsString:@"idle"] ||
+                [lower containsString:@"timeout"] ||
+                [lower containsString:@"disableauto"]) {
+                [out appendFormat:@"  INTERESTING: -[%@ %@]\n", className, selName];
+                found++;
+            }
+        }
+        if (methods) free(methods);
+
+        Class metaCls = object_getClass(allClasses[i]);
+        methods = class_copyMethodList(metaCls, &methodCount);
+        for (unsigned int j = 0; j < methodCount; j++) {
+            NSString *selName = NSStringFromSelector(method_getName(methods[j]));
+            NSString *lower = selName.lowercaseString;
+            if ([lower containsString:@"quiescen"] ||
+                [lower containsString:@"animationidle"] ||
+                [lower containsString:@"idle"] ||
+                [lower containsString:@"timeout"] ||
+                [lower containsString:@"disableauto"]) {
+                [out appendFormat:@"  INTERESTING: +[%@ %@]\n", className, selName];
+                found++;
+            }
+        }
+        if (methods) free(methods);
+    }
+    free(allClasses);
+    [out appendFormat:@"\nFound %d interesting methods across all XC* classes\n", found];
+    [out appendString:@"=== End Enumeration ===\n"];
+
+    // Write to file
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"xctest_diag.txt"];
+    NSError *writeErr = nil;
+    [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&writeErr];
+    NSLog(@"[XCTDiag] Wrote %lu bytes to %@%@",
+          (unsigned long)out.length, path,
+          writeErr ? [NSString stringWithFormat:@" (error: %@)", writeErr] : @"");
+}
+
++ (void)_appendMethodsForClass:(Class)cls label:(NSString *)label to:(NSMutableString *)out {
+    if (!cls) return;
+
+    // Instance methods
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    [out appendFormat:@"\n--- %@ instance methods (%u) ---\n", label, count];
+    for (unsigned int i = 0; i < count; i++) {
+        NSString *selName = NSStringFromSelector(method_getName(methods[i]));
+        [out appendFormat:@"  -[%@ %@]\n", label, selName];
+    }
+    if (methods) free(methods);
+
+    // Class methods
+    Class metaCls = object_getClass(cls);
+    methods = class_copyMethodList(metaCls, &count);
+    [out appendFormat:@"--- %@ class methods (%u) ---\n", label, count];
+    for (unsigned int i = 0; i < count; i++) {
+        NSString *selName = NSStringFromSelector(method_getName(methods[i]));
+        [out appendFormat:@"  +[%@ %@]\n", label, selName];
+    }
+    if (methods) free(methods);
+
+    // Properties
+    unsigned int propCount = 0;
+    objc_property_t *props = class_copyPropertyList(cls, &propCount);
+    if (propCount > 0) {
+        [out appendFormat:@"--- %@ properties (%u) ---\n", label, propCount];
+        for (unsigned int i = 0; i < propCount; i++) {
+            [out appendFormat:@"  @property %s (%s)\n", property_getName(props[i]), property_getAttributes(props[i])];
+        }
+    }
+    if (props) free(props);
 }
 
 // MARK: - Session Initialization
@@ -596,15 +852,73 @@ static void _installGlobalExceptionHandler(void) {
     return record;
 }
 
-// MARK: - Synthesis Chain (daemonProxy → session → eventSynthesizer)
+// MARK: - Synthesis Chain
+//
+// Synthesis priority (trying to avoid testmanagerd's ~5s quiescence wait):
+//   1. record.synthesizeWithError: — synchronous, may bypass daemon entirely
+//   2. XCUIDevice.eventSynthesizer.synthesizeEvent: — WDA's path
+//   3. daemonProxy._XCT_synthesizeEvent: — fire-and-forget (5s quiescence, unavoidable)
 
 + (void)_synthesizeEvent:(id)record completion:(void (^)(NSString *_Nullable))completion {
     _installNonFatalAssertionHandler();
-    [self _tryDaemonProxy:record completion:completion];
-}
 
-/// Path 1: daemonProxy._XCT_synthesizeEvent:completion: (system-level, preferred)
-+ (void)_tryDaemonProxy:(id)record completion:(void (^)(NSString *_Nullable))completion {
+    // Path 1: record.synthesizeWithError: — synchronous, may bypass daemon
+    @try {
+        SEL synthSel = @selector(synthesizeWithError:);
+        if ([record respondsToSelector:synthSel]) {
+            NSError *error = nil;
+            typedef BOOL (*MsgSend_BOOL_err)(id, SEL, NSError **);
+            BOOL result = ((MsgSend_BOOL_err)objc_msgSend)(record, synthSel, &error);
+            if (result && !error) {
+                sLastPathUsed = @"record.synthesizeWithError";
+                NSLog(@"[TouchSynthesizer] Path 1 (synthesizeWithError:) succeeded!");
+                completion(nil);
+                return;
+            }
+            NSLog(@"[TouchSynthesizer] Path 1 (synthesizeWithError:) failed: result=%d err=%@",
+                  result, error ? error.localizedDescription : @"nil");
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[TouchSynthesizer] Path 1 exception: %@", e.reason);
+    }
+
+    // Path 2: XCUIDevice.eventSynthesizer — WDA's path
+    if (cls_XCUIDevice) {
+        @try {
+            id device = [cls_XCUIDevice performSelector:@selector(sharedDevice)];
+            if (device) {
+                SEL esSel = @selector(eventSynthesizer);
+                if ([device respondsToSelector:esSel]) {
+                    id synthesizer = [device performSelector:esSel];
+                    if (synthesizer) {
+                        SEL synthSel = @selector(synthesizeEvent:completion:);
+                        if ([synthesizer respondsToSelector:synthSel]) {
+                            CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+                            ((MsgSend_void_id_id)objc_msgSend)(
+                                synthesizer, synthSel, record,
+                                ^(NSError *error) {
+                                    CFAbsoluteTime elapsed = CFAbsoluteTimeGetCurrent() - t0;
+                                    NSLog(@"[TouchSynthesizer] Path 2 (eventSynthesizer) completed: %.3fs err=%@",
+                                          elapsed, error ? error.localizedDescription : @"nil");
+                                    dispatch_async(dispatch_get_main_queue(), ^{
+                                        sLastPathUsed = @"eventSynthesizer";
+                                        completion(error ? error.localizedDescription : nil);
+                                    });
+                                }
+                            );
+                            return;
+                        }
+                    } else {
+                        NSLog(@"[TouchSynthesizer] Path 2: eventSynthesizer is nil");
+                    }
+                }
+            }
+        } @catch (NSException *e) {
+            NSLog(@"[TouchSynthesizer] Path 2 exception: %@", e.reason);
+        }
+    }
+
+    // Path 3: daemonProxy — fire-and-forget (5s quiescence unavoidable)
     if (cls_XCTRunnerDaemonSession) {
         @try {
             id session = [cls_XCTRunnerDaemonSession performSelector:@selector(sharedSession)];
@@ -616,89 +930,35 @@ static void _installGlobalExceptionHandler(void) {
                 if (proxy) {
                     SEL xctSel = @selector(_XCT_synthesizeEvent:completion:);
                     if ([proxy respondsToSelector:xctSel]) {
+                        // Fire-and-forget: send event, don't wait for completion
                         ((MsgSend_void_id_id)objc_msgSend)(
                             proxy, xctSel, record,
                             ^(NSError *error) {
-                                dispatch_async(dispatch_get_main_queue(), ^{
-                                    if (error) {
-                                        [self _trySessionSynthesize:record completion:completion];
-                                    } else {
-                                        sLastPathUsed = @"daemonProxy";
-                                        completion(nil);
-                                    }
-                                });
+                                sLastPathUsed = @"daemonProxy";
                             }
                         );
+                        completion(nil); // Return immediately
                         return;
                     }
                 }
-            }
-        } @catch (NSException *e) {
-            NSLog(@"[TouchSynthesizer] daemonProxy exception: %@", e.reason);
-        }
-    }
-    [self _trySessionSynthesize:record completion:completion];
-}
 
-/// Path 2: session.synthesizeEvent:completion: (XCTRunnerDaemonSession wrapper)
-+ (void)_trySessionSynthesize:(id)record completion:(void (^)(NSString *_Nullable))completion {
-    if (cls_XCTRunnerDaemonSession) {
-        @try {
-            id session = [cls_XCTRunnerDaemonSession performSelector:@selector(sharedSession)];
-            if (session) {
-                ((MsgSend_void_id_id)objc_msgSend)(
-                    session, @selector(synthesizeEvent:completion:), record,
-                    ^(NSError *error) {
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            if (error) {
-                                [self _tryEventSynthesizer:record completion:completion];
-                            } else {
-                                sLastPathUsed = @"session.synthesizeEvent";
-                                completion(nil);
-                            }
-                        });
-                    }
-                );
-                return;
-            }
-        } @catch (NSException *e) {
-            NSLog(@"[TouchSynthesizer] session.synthesize exception: %@", e.reason);
-        }
-    }
-    [self _tryEventSynthesizer:record completion:completion];
-}
-
-/// Path 3: XCUIDevice.eventSynthesizer (app-level, last resort)
-+ (void)_tryEventSynthesizer:(id)record completion:(void (^)(NSString *_Nullable))completion {
-    if (cls_XCUIDevice) {
-        @try {
-            id device = [cls_XCUIDevice performSelector:@selector(sharedDevice)];
-            if (device) {
-                SEL esSel = @selector(eventSynthesizer);
-                if ([device respondsToSelector:esSel]) {
-                    id synthesizer = [device performSelector:esSel];
-                    if (synthesizer) {
-                        ((MsgSend_void_id_id)objc_msgSend)(
-                            synthesizer, @selector(synthesizeEvent:completion:), record,
-                            ^(NSError *error) {
-                                dispatch_async(dispatch_get_main_queue(), ^{
-                                    if (error) {
-                                        completion([NSString stringWithFormat:@"All paths failed: %@", error.localizedDescription]);
-                                    } else {
-                                        sLastPathUsed = @"eventSynthesizer";
-                                        completion(nil);
-                                    }
-                                });
-                            }
-                        );
-                        return;
-                    }
+                // Fallback: session.synthesizeEvent
+                if ([session respondsToSelector:@selector(synthesizeEvent:completion:)]) {
+                    ((MsgSend_void_id_id)objc_msgSend)(
+                        session, @selector(synthesizeEvent:completion:), record,
+                        ^(NSError *error) {
+                            sLastPathUsed = @"session";
+                        }
+                    );
+                    completion(nil);
+                    return;
                 }
             }
         } @catch (NSException *e) {
-            NSLog(@"[TouchSynthesizer] eventSynthesizer exception: %@", e.reason);
+            NSLog(@"[TouchSynthesizer] Path 3 exception: %@", e.reason);
         }
     }
+
     completion(@"No synthesis path available");
 }
 
@@ -746,6 +1006,47 @@ static void _installGlobalExceptionHandler(void) {
     NSString *err = nil;
     id record = [self _buildBezierSwipeEventFrom:start controlPoint1:cp1 controlPoint2:cp2 to:end duration:duration error:&err];
     if (!record) { completion(err); return; }
+    [self _synthesizeEvent:record completion:completion];
+}
+
+// MARK: - Multi-Point Gesture (streamed touch)
+
++ (void)synthesizeMultiPointGestureWithPoints:(NSArray<NSValue *> *)points
+                                      offsets:(NSArray<NSNumber *> *)offsets
+                                     endPoint:(CGPoint)endPoint
+                                   liftOffset:(NSTimeInterval)liftOffset
+                                   completion:(void (^)(NSString *_Nullable))completion {
+    NSLog(@"[TouchSynthesizer] multiPointGesture: %lu points, duration=%.3f",
+          (unsigned long)points.count, liftOffset);
+    if (!sFrameworkLoaded) { completion(@"Not loaded"); return; }
+    if (points.count == 0) { completion(@"No points"); return; }
+
+    id record = [self _createEventRecordWithName:@"streamed gesture"];
+    if (!record) { completion(@"Failed to create event record"); return; }
+
+    // First point is the touch-down
+    CGPoint startPt = [points[0] CGPointValue];
+    id path = [cls_XCPointerEventPath alloc];
+    path = ((MsgSend_id_CGPoint_double)objc_msgSend)(
+        path, @selector(initForTouchAtPoint:offset:), startPt, 0.0);
+    if (!path) { completion(@"Failed to create event path"); return; }
+
+    // Add all subsequent points with their timing offsets
+    for (NSUInteger i = 1; i < points.count; i++) {
+        CGPoint pt = [points[i] CGPointValue];
+        double offset = [offsets[i] doubleValue];
+        ((MsgSend_void_CGPoint_double)objc_msgSend)(
+            path, @selector(moveToPoint:atOffset:), pt, offset);
+    }
+
+    // Move to the final end point
+    ((MsgSend_void_CGPoint_double)objc_msgSend)(
+        path, @selector(moveToPoint:atOffset:), endPoint, liftOffset - 0.01);
+
+    // Lift up
+    ((MsgSend_void_double)objc_msgSend)(path, @selector(liftUpAtOffset:), liftOffset);
+
+    ((MsgSend_void_id)objc_msgSend)(record, @selector(addPointerEventPath:), path);
     [self _synthesizeEvent:record completion:completion];
 }
 
@@ -804,12 +1105,66 @@ static void _installGlobalExceptionHandler(void) {
     });
 }
 
+// MARK: - IOKit HID Bundle ID Spoofing
+
+static BOOL sBundleIDSwizzled = NO;
+static IMP sOriginalBundleIdentifierIMP = NULL;
+
+static NSString *_spoofedBundleIdentifier(id self, SEL _cmd) {
+    return @"com.apple.springboard";
+}
+
++ (void)_installBundleIDSpoof {
+    if (sBundleIDSwizzled) return;
+    sBundleIDSwizzled = YES;
+
+    Method m = class_getInstanceMethod([NSBundle class], @selector(bundleIdentifier));
+    if (m) {
+        sOriginalBundleIdentifierIMP = method_getImplementation(m);
+        method_setImplementation(m, (IMP)_spoofedBundleIdentifier);
+        NSLog(@"[HID] Bundle ID spoofed to com.apple.springboard");
+        NSLog(@"[HID] Verify: mainBundle.bundleIdentifier = %@", [[NSBundle mainBundle] bundleIdentifier]);
+    }
+}
+
++ (void)_removeBundleIDSpoof {
+    if (!sBundleIDSwizzled || !sOriginalBundleIdentifierIMP) return;
+
+    Method m = class_getInstanceMethod([NSBundle class], @selector(bundleIdentifier));
+    if (m) {
+        method_setImplementation(m, sOriginalBundleIdentifierIMP);
+        sOriginalBundleIdentifierIMP = NULL;
+        sBundleIDSwizzled = NO;
+        NSLog(@"[HID] Bundle ID spoof removed, restored: %@", [[NSBundle mainBundle] bundleIdentifier]);
+    }
+}
+
+// MARK: - IOKit HID Status
+
++ (NSString *)hidStatus {
+    NSMutableString *status = [NSMutableString string];
+    [status appendFormat:@"IOKit handle: %@\n", sIOKitHandle ? @"loaded" : @"not loaded"];
+    [status appendFormat:@"HID client: %@\n", sHIDClient ? [NSString stringWithFormat:@"%p", sHIDClient] : @"NULL"];
+    [status appendFormat:@"HID system: %@\n", sHIDSystem ? [NSString stringWithFormat:@"%p", sHIDSystem] : @"NULL"];
+    [status appendFormat:@"FingerEvent fn: %@\n", p_FingerEvent ? @"found" : @"missing"];
+    [status appendFormat:@"DigitizerEvent fn: %@\n", p_DigitizerEvent ? @"found" : @"missing"];
+    [status appendFormat:@"ClientDispatch fn: %@\n", p_ClientDispatch ? @"found" : @"missing"];
+    [status appendFormat:@"SysDispatch fn: %@\n", p_SysDispatch ? @"found" : @"missing"];
+    [status appendFormat:@"SetInteger fn: %@\n", p_SetInteger ? @"found" : @"missing"];
+    [status appendFormat:@"SetSenderID fn: %@\n", p_SetSenderID ? @"found" : @"missing"];
+    [status appendFormat:@"Bundle ID swizzled: %@", sBundleIDSwizzled ? @"YES" : @"NO"];
+    return status;
+}
+
 // MARK: - IOKit HID Loading
 
 + (BOOL)_loadIOKit {
     if (sIOKitHandle && sHIDClient) return YES;
 
-    NSLog(@"[HID] Loading IOKit.framework...");
+    // Spoof bundle ID to com.apple.springboard before IOKit init
+    [self _installBundleIDSpoof];
+
+    NSLog(@"[HID] Loading IOKit.framework (bundleID=%@)...", [[NSBundle mainBundle] bundleIdentifier]);
     sIOKitHandle = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
     if (!sIOKitHandle) {
         NSLog(@"[HID] Failed to load IOKit: %s", dlerror());
@@ -854,6 +1209,10 @@ static void _installGlobalExceptionHandler(void) {
         }
     }
 
+    // Restore real bundle ID now that IOKit is initialized
+    [self _removeBundleIDSpoof];
+
+    NSLog(@"[HID] Load complete. client=%p system=%p", sHIDClient, sHIDSystem);
     return YES;
 }
 
@@ -941,6 +1300,15 @@ static void _installGlobalExceptionHandler(void) {
         return NO;
     }
     return YES;
+}
+
+// MARK: - HID Single-Phase Dispatch (for real-time streaming)
+
++ (BOOL)hidDispatchFingerAtPoint:(CGPoint)point
+                        touching:(BOOL)touching
+                         inRange:(BOOL)inRange {
+    if (![self _loadIOKit]) return NO;
+    return [self _dispatchFingerAtPoint:point touching:touching inRange:inRange error:nil];
 }
 
 // MARK: - HID Tap

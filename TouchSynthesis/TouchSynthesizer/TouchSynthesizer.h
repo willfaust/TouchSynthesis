@@ -98,7 +98,26 @@ NS_ASSUME_NONNULL_BEGIN
 + (void)pressButton:(NSUInteger)button
          completion:(void (^)(NSString *_Nullable error))completion;
 
+// MARK: - Multi-Point Gesture (streamed touch)
+
+/// Synthesize a gesture from accumulated streamed touch points.
+/// Each point has a corresponding time offset from the gesture start.
++ (void)synthesizeMultiPointGestureWithPoints:(NSArray<NSValue *> *)points
+                                      offsets:(NSArray<NSNumber *> *)offsets
+                                     endPoint:(CGPoint)endPoint
+                                   liftOffset:(NSTimeInterval)liftOffset
+                                   completion:(void (^)(NSString *_Nullable error))completion;
+
 // MARK: - IOKit HID Fallback
+
+/// Returns a diagnostic string describing IOKit HID state (client, system, symbols loaded).
++ (NSString *)hidStatus;
+
+/// Dispatch a single finger event via IOKit HID. For real-time streaming.
+/// Returns YES on success. Loads IOKit lazily on first call.
++ (BOOL)hidDispatchFingerAtPoint:(CGPoint)point
+                        touching:(BOOL)touching
+                         inRange:(BOOL)inRange;
 
 /// Inject a tap via IOKit HID (bypasses XCTest/testmanagerd).
 + (void)hidTapAtPoint:(CGPoint)point

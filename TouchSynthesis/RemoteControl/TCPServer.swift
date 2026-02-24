@@ -14,7 +14,9 @@ class TCPServer {
     }
 
     func start() throws {
-        let params = NWParameters.tcp
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true  // Disable Nagle's algorithm for low-latency sends
+        let params = NWParameters(tls: nil, tcp: tcpOptions)
         params.allowLocalEndpointReuse = true
 
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {

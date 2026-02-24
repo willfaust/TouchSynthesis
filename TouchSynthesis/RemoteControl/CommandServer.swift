@@ -317,110 +317,97 @@ class CommandServer: ObservableObject {
     }
 
     /// Stream screenshots via XCTest daemon proxy (reuses existing XPC connection).
+    /// Uses callback-based pipeline: capture overlaps with send for maximum throughput.
     private func startXCTestStream(client: ClientConnection, quality: CGFloat) {
         logger.log("Using XCTest screenshot path", phase: "REMOTE", level: .info)
 
-        screenshotQueue.async { [weak self, weak client] in
-            var frameCount = 0
-            var fpsTimer = CACurrentMediaTime()
-            var sendInFlight = false
-            var consecutiveErrors = 0
+        // All state accessed only from screenshotQueue (serial)
+        var frameCount = 0
+        var fpsTimer = CACurrentMediaTime()
+        var consecutiveErrors = 0
+        var captureInFlight = false
+        var sendInFlight = false
 
-            while let client, client.streaming {
-                guard self != nil else { break }
-
-                // Backpressure: wait if previous send hasn't completed
-                if sendInFlight {
-                    Thread.sleep(forTimeInterval: 0.01)
-                    continue
+        // Recursive capture function — each capture triggers the next
+        func captureNext() {
+            self.screenshotQueue.async { [weak self, weak client] in
+                guard let self, let client, client.streaming else {
+                    DispatchQueue.main.async { self?.logger.log("XCTest stream stopped", phase: "REMOTE", level: .info) }
+                    return
                 }
+                guard !captureInFlight else { return }
+                captureInFlight = true
 
-                let captureStart = CACurrentMediaTime()
+                TouchSynthesizer.takeScreenshot(withQuality: quality) { [weak self, weak client] data, error in
+                    self?.screenshotQueue.async {
+                        captureInFlight = false
+                        guard let self, let client, client.streaming else { return }
 
-                // Synchronous wait for async XCTest screenshot
-                let semaphore = DispatchSemaphore(value: 0)
-                var resultData: Data?
-                var resultError: String?
-
-                TouchSynthesizer.takeScreenshot(withQuality: quality) { data, error in
-                    resultData = data as Data?
-                    resultError = error
-                    semaphore.signal()
-                }
-
-                let timeout = semaphore.wait(timeout: .now() + 5.0)
-                if timeout == .timedOut {
-                    consecutiveErrors += 1
-                    if consecutiveErrors >= 3 {
-                        DispatchQueue.main.async {
-                            self?.logger.log("XCTest screenshot timed out 3x, falling back to CDTunnel", phase: "REMOTE", level: .warning)
+                        guard let jpegData = data as Data? else {
+                            consecutiveErrors += 1
+                            if consecutiveErrors >= 5 {
+                                DispatchQueue.main.async {
+                                    self.logger.log("XCTest screenshot failed 5x (\(error ?? "unknown")), falling back to CDTunnel", phase: "REMOTE", level: .warning)
+                                }
+                                if let tunnel = self.tunnel {
+                                    self.startCDTunnelStream(client: client, tunnel: tunnel, quality: quality)
+                                }
+                                return
+                            }
+                            captureNext()
+                            return
                         }
-                        // Fall back to CDTunnel
-                        if let tunnel = self?.tunnel {
-                            self?.startCDTunnelStream(client: client, tunnel: tunnel, quality: quality)
+                        consecutiveErrors = 0
+
+                        // If we got PNG, convert to JPEG
+                        var finalData = jpegData
+                        if jpegData.count > 2, jpegData[0] == 0x89, jpegData[1] == 0x50 {
+                            if let img = UIImage(data: jpegData),
+                               let converted = img.jpegData(compressionQuality: quality) {
+                                finalData = converted
+                            }
                         }
-                        return
-                    }
-                    Thread.sleep(forTimeInterval: 0.05)
-                    continue
-                }
 
-                guard let jpegData = resultData else {
-                    consecutiveErrors += 1
-                    if consecutiveErrors >= 5 {
-                        DispatchQueue.main.async {
-                            self?.logger.log("XCTest screenshot failed 5x (\(resultError ?? "unknown")), falling back to CDTunnel", phase: "REMOTE", level: .warning)
+                        // Backpressure: drop this frame if previous send still in flight
+                        if sendInFlight {
+                            captureNext()
+                            return
                         }
-                        if let tunnel = self?.tunnel {
-                            self?.startCDTunnelStream(client: client, tunnel: tunnel, quality: quality)
+
+                        // Send frame
+                        let frame = FrameCodec.encodeBinary(finalData)
+                        sendInFlight = true
+                        client.nwConn.send(content: frame, completion: .contentProcessed { [weak self] _ in
+                            self?.screenshotQueue.async {
+                                sendInFlight = false
+                                captureNext()  // Kick capture if it was waiting on backpressure
+                            }
+                        })
+
+                        // FPS logging every 3 seconds
+                        frameCount += 1
+                        let now = CACurrentMediaTime()
+                        if now - fpsTimer >= 3.0 {
+                            let fps = Double(frameCount) / (now - fpsTimer)
+                            let kb = finalData.count / 1024
+                            DispatchQueue.main.async { [weak self] in
+                                self?.logger.log(
+                                    String(format: "XCTest Stream: %.1f FPS, %dKB/frame", fps, kb),
+                                    phase: "REMOTE", level: .debug
+                                )
+                            }
+                            frameCount = 0
+                            fpsTimer = now
                         }
-                        return
-                    }
-                    Thread.sleep(forTimeInterval: 0.05)
-                    continue
-                }
-                consecutiveErrors = 0
 
-                let captureTime = CACurrentMediaTime() - captureStart
-
-                // If we got PNG (from simple path), convert to JPEG
-                var finalData = jpegData
-                if jpegData.count > 8, jpegData[0] == 0x89, jpegData[1] == 0x50 { // PNG magic
-                    if let uiImage = UIImage(data: jpegData),
-                       let converted = uiImage.jpegData(compressionQuality: quality) {
-                        finalData = converted
+                        // Start next capture immediately — overlaps with network send
+                        captureNext()
                     }
                 }
-
-                // Send binary frame
-                let frame = FrameCodec.encodeBinary(finalData)
-                sendInFlight = true
-                client.nwConn.send(content: frame, completion: .contentProcessed { _ in
-                    sendInFlight = false
-                })
-
-                // FPS logging every 3 seconds
-                frameCount += 1
-                let now = CACurrentMediaTime()
-                if now - fpsTimer >= 3.0 {
-                    let fps = Double(frameCount) / (now - fpsTimer)
-                    let kb = finalData.count / 1024
-                    DispatchQueue.main.async { [weak self] in
-                        self?.logger.log(
-                            String(format: "XCTest Stream: %.1f FPS, capture=%.0fms, %dKB/frame",
-                                   fps, captureTime * 1000, kb),
-                            phase: "REMOTE", level: .debug
-                        )
-                    }
-                    frameCount = 0
-                    fpsTimer = now
-                }
-            }
-
-            DispatchQueue.main.async {
-                self?.logger.log("XCTest stream stopped", phase: "REMOTE", level: .info)
             }
         }
+
+        captureNext()
     }
 
     /// Stream screenshots via CDTunnel (fallback — creates a new tunnel per frame).

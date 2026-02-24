@@ -631,7 +631,6 @@ static void _installGlobalExceptionHandler(void) {
 
 + (void)tapAtPoint:(CGPoint)point
         completion:(void (^)(NSString *_Nullable))completion {
-    NSLog(@"[TouchSynthesizer] tapAtPoint:(%.0f, %.0f)", point.x, point.y);
     if (!sFrameworkLoaded) { completion(@"Not loaded"); return; }
 
     NSString *err = nil;
@@ -654,7 +653,6 @@ static void _installGlobalExceptionHandler(void) {
 + (void)swipeFromPoint:(CGPoint)from toPoint:(CGPoint)to
               duration:(NSTimeInterval)duration
             completion:(void (^)(NSString *_Nullable))completion {
-    NSLog(@"[TouchSynthesizer] swipe (%.0f,%.0f)->(%.0f,%.0f)", from.x, from.y, to.x, to.y);
     if (!sFrameworkLoaded) { completion(@"Not loaded"); return; }
 
     NSString *err = nil;
@@ -871,7 +869,6 @@ static void _installGlobalExceptionHandler(void) {
             BOOL result = ((MsgSend_BOOL_err)objc_msgSend)(record, synthSel, &error);
             if (result && !error) {
                 sLastPathUsed = @"record.synthesizeWithError";
-                NSLog(@"[TouchSynthesizer] Path 1 (synthesizeWithError:) succeeded!");
                 completion(nil);
                 return;
             }
